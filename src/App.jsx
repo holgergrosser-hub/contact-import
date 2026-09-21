@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { localParse, formatPhone } from "./localParse.js";
 
 const SCRIPT_URL =
   "https://script.google.com/macros/s/AKfycbxcV-wb52T-ju4301RxBwXlZL2w0p3Uw1DxYplDuZbAXNoIRIUGg2XIvHzcd_UEfg8vSw/exec";
@@ -53,6 +54,8 @@ export default function App() {
   const [rawText, setRawText] = useState("");
   const [parsing, setParsing] = useState(false);
   const [parseError, setParseError] = useState("");
+  const [parseNote, setParseNote] = useState("");
+  const [sendError, setSendError] = useState("");
   const [showPaste, setShowPaste] = useState(true);
 
   const set = (k, v) => setD((p) => ({ ...p, [k]: v }));
@@ -65,40 +68,87 @@ export default function App() {
     if (!rawText.trim()) return;
     setParsing(true);
     setParseError("");
+    setParseNote("");
+
+    // Lokale Erkennung läuft immer mit: füllt Lücken der KI und ersetzt sie bei Ausfall.
+    const local = localParse(rawText);
+    let ai = null;
+    let aiError = "";
+
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 15000);
     try {
       const res = await fetch("/api/parse-contact", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text: rawText }),
+        signal: ctrl.signal,
       });
-      if (!res.ok) throw new Error("API Fehler");
-      const parsed = await res.json();
-      if (parsed.error) throw new Error(parsed.error);
-      setD((prev) => {
-        const merged = { ...prev };
-        for (const key of Object.keys(empty)) {
-          if (parsed[key]) merged[key] = parsed[key];
-        }
-        return merged;
-      });
-      setShowPaste(false);
+      const body = await res.json().catch(() => null);
+      if (!res.ok || !body || body.error) {
+        throw new Error(body?.error || `Server-Fehler ${res.status}`);
+      }
+      ai = body;
     } catch (e) {
-      setParseError(e.message || "Fehler beim Parsen");
+      aiError = e.name === "AbortError" ? "Zeitüberschreitung" : e.message || "nicht erreichbar";
     } finally {
-      setParsing(false);
+      clearTimeout(timer);
     }
+
+    const result = { ...empty };
+    for (const key of Object.keys(empty)) {
+      const v = typeof ai?.[key] === "string" ? ai[key].trim() : "";
+      result[key] = v || local[key] || "";
+    }
+    for (const k of ["phoneMobile", "phoneWork", "phoneFax"]) {
+      if (result[k] && !result[k].startsWith("+")) result[k] = formatPhone(result[k]);
+    }
+
+    const found = Object.keys(empty).some((k) => k !== "notes" && result[k]);
+    if (!found) {
+      setParseError(
+        aiError
+          ? `Nichts erkannt (KI: ${aiError}). Bitte Text prüfen oder manuell eingeben.`
+          : "Im Text wurden keine Kontaktdaten gefunden."
+      );
+    } else {
+      setD(result);
+      setOpen((p) => ({ ...p, Sonstiges: p.Sonstiges || !!result.notes }));
+      if (aiError) setParseNote(`KI nicht verfügbar (${aiError}) – lokal erkannt, bitte Felder prüfen.`);
+      setShowPaste(false);
+    }
+    setParsing(false);
   };
 
   /* ── Send to Google Contacts ── */
   const send = async () => {
+    if (!fullName && !d.company) {
+      setSendError("Bitte mindestens Name oder Firma angeben.");
+      setStatus("error");
+      return;
+    }
     setStatus("sending");
+    setSendError("");
     try {
       const formData = new FormData();
-      const payload = { ...d, fullName };
-      Object.keys(payload).forEach((k) => formData.append(k, payload[k]));
-      await fetch(SCRIPT_URL, { method: "POST", body: formData });
+      // Firmenkontakt ohne Ansprechpartner: Firma als Anzeigename
+      const payload = { ...d, fullName: fullName || d.company };
+      Object.keys(payload).forEach((k) => formData.append(k, String(payload[k] ?? "").trim()));
+      const res = await fetch(SCRIPT_URL, { method: "POST", body: formData });
+      if (!res.ok) throw new Error(`Google Apps Script antwortet mit ${res.status}`);
+      // Meldet das Script einen Fehler im Body, nicht als Erfolg anzeigen
+      const text = await res.text().catch(() => "");
+      try {
+        const j = JSON.parse(text);
+        if (j && (j.error || j.success === false || j.status === "error")) {
+          throw new Error(j.error || j.message || "Script meldet einen Fehler");
+        }
+      } catch (e) {
+        if (!(e instanceof SyntaxError)) throw e;
+      }
       setStatus("done");
-    } catch {
+    } catch (e) {
+      setSendError(e.message === "Failed to fetch" ? "" : e.message || "");
       setStatus("error");
     }
   };
@@ -109,6 +159,8 @@ export default function App() {
     setRawText("");
     setShowPaste(true);
     setParseError("");
+    setParseNote("");
+    setSendError("");
   };
 
   const pills = [
@@ -178,6 +230,14 @@ export default function App() {
             >Manuell</button>
           </div>
         </div>
+      )}
+
+      {parseNote && (
+        <div style={{
+          maxWidth: 460, margin: "0 auto 12px", boxSizing: "border-box",
+          background: "#fef3c7", border: "1.5px solid #fcd34d", borderRadius: 12,
+          padding: "10px 14px", fontSize: 12, color: "#92400e", lineHeight: 1.4,
+        }}>⚠ {parseNote}</div>
       )}
 
       {/* ── Header Card ── */}
@@ -319,7 +379,7 @@ export default function App() {
               fontSize: 22, color: "#fff",
             }}>✕</div>
             <div style={{ fontSize: 16, fontWeight: 700, color: "#1a1a1a" }}>Fehler beim Senden</div>
-            <div style={{ fontSize: 13, color: "#999", marginTop: 4 }}>Bitte Verbindung prüfen und erneut versuchen.</div>
+            <div style={{ fontSize: 13, color: "#999", marginTop: 4 }}>{sendError || "Bitte Verbindung prüfen und erneut versuchen."}</div>
             <button onClick={() => setStatus("idle")} style={{
               marginTop: 16, padding: "8px 28px", border: "1.5px solid #e8e8e6",
               borderRadius: 10, background: "none", fontFamily: font, fontSize: 13,
